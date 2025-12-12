@@ -1,0 +1,909 @@
+---
+title: "Midterm Project"
+author: "Abigail White"
+toc: true
+number-sections: true
+highlight-style: pygments
+format: 
+  html: 
+    code-fold: true
+    html-math-method: katex
+    embed-resources: true
+    self-contained-math: true	
+  pdf: 
+    geometry: 
+      - top=30mm
+      - left=20mm
+##  docx: Never, unless to accommodate a collaborator
+---
+
+## Noise Complaints in NYC
+
+### a. Data Cleaning 
+
+**i.)**
+
+```{python}
+# Import and rename columns
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# Path to dataset 
+SRC = Path("data/nypd311w062925noise_by100625.csv")
+
+# Read the data safely
+df = pd.read_csv(SRC, low_memory=False)
+
+# Display basic info
+print("Original shape:", df.shape)
+print("Original column names:")
+print(df.columns.tolist())
+
+# Rename columns into clean snake_case style
+df.columns = (
+    df.columns.str.strip() # remove leading/trailing spaces
+              .str.lower() # lowercase
+              .str.replace(r"[^\w]+", "_", regex=True) 
+              # replace spaces/punctuation with underscores
+              .str.strip("_") # remove leading/trailing underscores
+)
+
+print("\nCleaned column names:")
+print(df.columns.tolist())
+
+# Preview first few rows
+df.head()
+```
+
+**ii.)**
+
+```{python}
+# Summarize missing information
+
+# Count missing values for each column
+missing_counts = df.isna().sum()
+
+# Calculate percentage of missing values per column
+missing_percent = (missing_counts / len(df)) * 100
+
+# Combine into a summary DataFrame
+missing_summary = (
+    pd.DataFrame({
+        "missing_count": missing_counts,
+        "missing_percent": missing_percent
+    })
+    .sort_values("missing_percent", ascending=False)
+)
+
+# Display top 15 columns with the highest missing percentages
+print("Top columns with most missing values:")
+display(missing_summary.head(15))
+
+# Identify variables that are almost completely missing (>=90% missing)
+nearly_empty = missing_summary[missing_summary["missing_percent"] >= 90]
+print("\nVariables that are close to completely missing (>=90% missing):")
+display(nearly_empty)
+```
+
+The dataset includes several variables with extreme missingness. Eight columns
+are entirely empty (100%), and one (vehicle_type) is 94% missing. These likely 
+correspond to fields irrelevant to noise complaints (e.g., bridge or taxi 
+information). Removing these columns will simplify analysis without losing 
+meaningful information.
+
+```{python}
+# Remove columns with >=90% missing values
+
+# List of columns to drop (based on missingness output)
+drop_cols = [
+    "due_date",
+    "bridge_highway_segment",
+    "road_ramp",
+    "bridge_highway_direction",
+    "bridge_highway_name",
+    "taxi_pick_up_location",
+    "taxi_company_borough",
+    "facility_type",
+    "vehicle_type"
+]
+
+# Drop them safely if they exist in df
+df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+
+print("Dropped columns:")
+print(drop_cols)
+print("New shape after dropping:", df.shape)
+
+# Confirm none remain
+remaining = [c for c in drop_cols if c in df.columns]
+print("Remaining (should be empty):", remaining)
+```
+
+**iii.)**
+
+```{python}
+# Check for redundant information and test Arrow format efficiency
+
+import time
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# Identify constant columns (contain only one unique non-null value)
+constant_cols = []
+for col in df.columns:
+    unique_nonnull = df[col].dropna().nunique()
+    if unique_nonnull <= 1:
+        constant_cols.append(col)
+
+print("Constant columns (same value for all rows):", constant_cols)
+
+# Drop them if any found
+df = df.drop(columns=constant_cols, errors="ignore")
+print("Shape after removing constant columns:", df.shape)
+
+# Check for completely duplicate columns
+duplicate_groups = []
+checked = set()
+
+for i, col1 in enumerate(df.columns):
+    if col1 in checked:
+        continue
+    group = [col1]
+    for col2 in df.columns[i + 1:]:
+        if col2 in checked:
+            continue
+        if df[col1].equals(df[col2]):
+            group.append(col2)
+            checked.add(col2)
+    if len(group) > 1:
+        duplicate_groups.append(group)
+        checked.update(group)
+
+print("\nDuplicate column groups found:", duplicate_groups)
+
+# Remove duplicate columns manually
+# Decide which one to keep from each duplicate pair
+dupe_to_drop = [
+    "intersection_street_1",   # same as cross_street_1
+    "intersection_street_2",   # same as cross_street_2
+    "park_borough"             # same as borough
+]
+
+# Drop them safely
+df = df.drop(columns=[c for c in dupe_to_drop if c in df.columns], errors="ignore")
+
+print("Dropped duplicate columns:", dupe_to_drop)
+print("New shape after dropping duplicates:", df.shape)
+
+# Store data in Arrow format and compare file size + read speed
+from pathlib import Path
+
+OUT_DIR = Path("data")
+OUT_DIR.mkdir(exist_ok=True)
+
+csv_path = OUT_DIR / "nypd311w062925noise_by100625.csv"
+feather_path = OUT_DIR / "nypd311w062925noise_by100625.feather"
+parquet_path = OUT_DIR / "nypd311w062925noise_by100625.parquet"
+
+# Save in Feather and Parquet (Arrow-based)
+t0 = time.perf_counter()
+df.to_feather(feather_path)
+t1 = time.perf_counter()
+feather_time = t1 - t0
+
+t0 = time.perf_counter()
+df.to_parquet(parquet_path, index=False)
+t1 = time.perf_counter()
+parquet_time = t1 - t0
+
+# Compare file sizes (MB)
+import os
+csv_size = os.path.getsize(csv_path) / (1024**2)
+feather_size = os.path.getsize(feather_path) / (1024**2)
+parquet_size = os.path.getsize(parquet_path) / (1024**2)
+
+print("\n--- File size comparison (MB) ---")
+print(f"CSV:     {csv_size:.2f} MB")
+print(f"Feather: {feather_size:.2f} MB (Arrow)")
+print(f"Parquet: {parquet_size:.2f} MB (Arrow)")
+
+# Compare read speed
+# CSV read time
+t0 = time.perf_counter()
+_ = pd.read_csv(csv_path, low_memory=False)
+csv_read = time.perf_counter() - t0
+
+# Feather read time
+t0 = time.perf_counter()
+_ = pd.read_feather(feather_path)
+feather_read = time.perf_counter() - t0
+
+# Parquet read time
+t0 = time.perf_counter()
+_ = pd.read_parquet(parquet_path)
+parquet_read = time.perf_counter() - t0
+
+print("\n--- Read speed comparison (seconds) ---")
+print(f"CSV read:     {csv_read:.3f}")
+print(f"Feather read: {feather_read:.3f}")
+print(f"Parquet read: {parquet_read:.3f}")
+```
+
+Removing redundant columns reduced data size and improved interpretability. 
+Converting to Arrow formats further reduced the file size by over 60 -80% and
+improved read speeds by 2-4 times, confirming that Arrow storage is substantially
+more efficient and adaptable than traditional CSV files.
+
+**iv.)**
+
+```{python}
+# Validate and clean ZIP codes and boroughs
+
+# Standardize text columns
+df["borough"] = df["borough"].astype("string").str.strip().str.upper()
+df["incident_zip"] = df["incident_zip"].astype("string").str.strip()
+
+# Helper functions to check valid NYC ZIPs and map them to boroughs 
+def normalize_zip(z):
+    """Keep only digits and format as 5-digit ZIP."""
+    if pd.isna(z):
+        return pd.NA
+    s = "".join(ch for ch in str(z) if ch.isdigit())
+    if len(s) == 0:
+        return pd.NA
+    return s[:5].zfill(5)
+
+def is_nyc_zip(z):
+    """Return True if ZIP belongs to a known NYC range."""
+    if z is pd.NA or not isinstance(z, str) or len(z) != 5:
+        return False
+    p3 = int(z[:3])
+    if 100 <= p3 <= 102:  # Manhattan
+        return True
+    if p3 == 103:        # Staten Island
+        return True
+    if p3 == 104:        # Bronx
+        return True
+    if p3 == 112:        # Brooklyn
+        return True
+    if p3 in {111, 113, 114, 116} or z in {"11004", "11005"}:  # Queens
+        return True
+    return False
+
+def zip_to_boro(z):
+    """Return borough name based on ZIP."""
+    if z is pd.NA or not isinstance(z, str) or len(z) != 5:
+        return pd.NA
+    p3 = int(z[:3])
+    if 100 <= p3 <= 102:
+        return "MANHATTAN"
+    if p3 == 103:
+        return "STATEN ISLAND"
+    if p3 == 104:
+        return "BRONX"
+    if p3 == 112:
+        return "BROOKLYN"
+    if p3 in {111, 113, 114, 116} or z in {"11004", "11005"}:
+        return "QUEENS"
+    return pd.NA
+
+# Apply cleaning and validation
+df["incident_zip"] = df["incident_zip"].map(normalize_zip)
+df["zip_is_nyc"] = df["incident_zip"].apply(is_nyc_zip)
+df["zip_borough_guess"] = df["incident_zip"].apply(zip_to_boro)
+
+# Count invalid ZIPs and mismatches
+invalid_zip_count = (~df["zip_is_nyc"]).sum()
+print(f"Invalid NYC ZIPs: {invalid_zip_count}")
+
+# Where both ZIP and borough exist, check for mismatches
+both = df["borough"].notna() & df["zip_borough_guess"].notna()
+mismatch = both & (df["borough"] != df["zip_borough_guess"])
+print(f"Borough/ZIP mismatches: {mismatch.sum()}")
+
+# Clean data
+# Replace invalid ZIPs with NA
+df.loc[~df["zip_is_nyc"], "incident_zip"] = pd.NA
+
+# Replace invalid boroughs (not one of the five)
+valid_boros = {"MANHATTAN", "BRONX", "BROOKLYN", "QUEENS", "STATEN ISLAND"}
+df.loc[~df["borough"].isin(valid_boros), "borough"] = pd.NA
+
+# Fix mismatched boroughs where ZIP clearly indicates correct borough
+df.loc[mismatch, "borough"] = df.loc[mismatch, "zip_borough_guess"]
+
+print("\nAfter cleaning:")
+print("Invalid ZIPs reset to NA and boroughs corrected based on ZIP mapping.")
+print("Current unique boroughs:", df["borough"].dropna().unique())
+```
+
+Six invalid ZIP codes were reset to NA, and five borough ZIP mismatches were 
+corrected based on official NYC ZIP mappings. The final dataset includes all 
+five standardized boroughs and is free of geographic inconsistencies.
+
+**v.)**
+
+```{python}
+# Identify potential date errors 
+
+# Ensure datetime format and handle invalid parsing safely
+df["created_date"] = pd.to_datetime(
+    df["created_date"],
+    format="%m/%d/%Y %I:%M:%S %p",
+    errors="coerce"
+)
+
+df["closed_date"] = pd.to_datetime(
+    df["closed_date"],
+    format="%m/%d/%Y %I:%M:%S %p",
+    errors="coerce"
+)
+
+# Detect which "action update" column exists and handle accordingly
+if "action_update_date" in df.columns:
+    df["action_update_date"] = pd.to_datetime(
+        df["action_update_date"],
+        format="%m/%d/%Y %I:%M:%S %p",
+        errors="coerce"
+    )
+
+elif "resolution_action_updated_date" in df.columns:
+    df["action_update_date"] = pd.to_datetime(
+        df["resolution_action_updated_date"],
+        format="%m/%d/%Y %I:%M:%S %p",
+        errors="coerce"
+    )
+
+elif "resolution_action_update_date" in df.columns:
+    df["action_update_date"] = pd.to_datetime(
+        df["resolution_action_update_date"],
+        format="%m/%d/%Y %I:%M:%S %p",
+        errors="coerce"
+    )
+
+else:
+    # Create placeholder column if none found
+    df["action_update_date"] = pd.NaT
+    print("No action update column found - created placeholder 'action_update_date'.")
+
+# closed_date earlier than created_date
+mask_early_close = (
+    df["closed_date"].notna() & df["created_date"].notna() &
+    (df["closed_date"] < df["created_date"])
+)
+early_close_count = mask_early_close.sum()
+
+# closed_date and created_date exactly equal to the second
+mask_same_second = (
+    df["closed_date"].notna() & df["created_date"].notna() &
+    (df["closed_date"] == df["created_date"])
+)
+same_second_count = mask_same_second.sum()
+
+# timestamps exactly at midnight or noon
+def count_exact_time(col, hh, mm, ss):
+    return (
+        df[col].dt.hour.eq(hh) &
+        df[col].dt.minute.eq(mm) &
+        df[col].dt.second.eq(ss)
+    )
+
+midnight_created = count_exact_time("created_date", 0, 0, 0).sum()
+noon_created = count_exact_time("created_date", 12, 0, 0).sum()
+midnight_closed = count_exact_time("closed_date", 0, 0, 0).sum()
+noon_closed = count_exact_time("closed_date", 12, 0, 0).sum()
+
+# action_update_date after closed_date
+mask_update_after_close = (
+    df["action_update_date"].notna() & df["closed_date"].notna() &
+    (df["action_update_date"] > df["closed_date"])
+)
+update_after_close_count = mask_update_after_close.sum()
+
+# Print summary
+print("Date quality checks:")
+print(f"1. Closed before created: {early_close_count}")
+print(f"2. Closed = created (to the second): {same_second_count}")
+print(f"3. Created exactly midnight: {midnight_created}, noon: {noon_created}")
+print(f"   Closed exactly midnight: {midnight_closed}, noon: {noon_closed}")
+print(f"4. Action update after closed: {update_after_close_count}")
+
+```
+
+No date inconsistencies were found between creation and closure times, and no 
+placeholder timestamps were detected. Although almost all records have an 
+"action update" time after closure, this behavior reflects post-closure system 
+updates rather than true data errors.
+
+**vi.)**
+
+- Standardize column naming conventions:  
+  Adopt consistent, lowercase, underscore-separated column names  
+  (e.g., created_date, closed_date, incident_zip) to simplify  
+  merging and analysis across 311 datasets.
+
+- Remove redundant or constant variables:  
+  Columns such as agency, agency_name, and status contain the  
+  same value across all records and add unnecessary file size.  
+  Similarly, duplicated fields like intersection_street_1 and  
+  cross_street_1 should be consolidated.
+
+- Validate and enforce ZIP-borough consistency:  
+  Six invalid ZIP codes and five mismatched borough-ZIP combinations  
+  were identified. Applying automatic ZIP-to-borough cross-checking  
+  during data entry would prevent these inconsistencies.
+
+- Improve temporal data integrity:   
+  Although core timestamps (created_date, closed_date) are  
+  consistent, the field action_update_date consistently appears  
+  after closure, suggesting post-processing or delayed updates.  
+  Including clearer metadata about event sequence or update timing  
+  would improve interpretability.
+
+- Clarify or standardize datetime formatting:  
+  The dataset mixes string-based timestamps that require flexible  
+  parsing. Using a unified format (e.g., YYYY-MM-DD HH:MM:SS) across  
+  all records would improve consistency and prevent parsing issues.
+
+- Encourage use of modern storage formats:  
+  Converting the dataset to Arrow-based formats such as Feather or  
+  Parquet dramatically reduced file size (from 7.7 MB to 1.3 MB)  
+  and improved read speed. Archiving future releases in these formats  
+  would enhance performance and reproducibility.
+
+
+### b. Data Exploration
+
+**i.)**
+
+```{python}
+# Compute response time in hours 
+df["response_hours"] = (
+    (df["closed_date"] - df["created_date"]).dt.total_seconds() / 3600
+)
+
+# Create time-of-day, weekday/weekend, and hour variables
+df["hour"] = df["created_date"].dt.hour
+df["day_period"] = np.where(df["hour"].between(6, 17), "Daytime", "Nighttime")
+df["dayofweek"] = df["created_date"].dt.dayofweek
+df["is_weekend"] = np.where(df["dayofweek"] >= 5, "Weekend/Holiday", "Weekday")
+
+# Quick check
+df[["response_hours", "day_period", "borough", "complaint_type", "is_weekend"]].head()
+
+
+# Response Time by Borough and Time of Day
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+sns.boxplot(
+    data=df,
+    x="borough",
+    y="response_hours",
+    hue="day_period",
+    showfliers=False,
+    palette="Set2"
+)
+plt.title("311 Noise Complaint Response Time by Borough and Time of Day")
+plt.ylabel("Response Time (hours)")
+plt.xlabel("Borough")
+plt.legend(title="Time of Day")
+plt.show()
+
+# Response Time by Complaint Type and Time of Day
+plt.figure(figsize=(12, 6))
+sns.boxplot(
+    data=df,
+    x="complaint_type",
+    y="response_hours",
+    hue="day_period",
+    showfliers=False,
+    palette="pastel"
+)
+plt.title("Response Time by Complaint Type and Time of Day")
+plt.ylabel("Response Time (hours)")
+plt.xlabel("Complaint Type")
+plt.legend(title="Time of Day")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+plt.show()
+
+# Weekday vs Weekend/Holiday Comparison
+plt.figure(figsize=(8, 6))
+sns.boxplot(
+    data=df,
+    x="is_weekend",
+    y="response_hours",
+    hue="day_period",
+    showfliers=False,
+    palette="coolwarm"
+)
+plt.title("Response Time by Day Type and Time of Day")
+plt.ylabel("Response Time (hours)")
+plt.xlabel("Day Type")
+plt.legend(title="Time of Day")
+plt.show()
+```
+
+The boxplots show that response times for 311 noise complaints vary across 
+boroughs, complaint types, and times of day. The Bronx and Staten Island 
+generally have longer and more variable response times, while Manhattan and 
+Queens show greater consistency. Daytime complaints take longer to resolve than 
+nighttime ones, likely because daytime hours experience higher service demand. 
+Residential and street-related complaints tend to take longer to close than park 
+or house-of-worship complaints, reflecting heavier daytime call volume. Responses 
+are also slower on weekends and holidays compared to weekdays. Overall, response 
+time depends on both the time and context of each complaint.
+
+**ii.)**
+
+```{python}
+from scipy import stats
+
+# Separate response times for day vs night
+day = df.loc[df["day_period"] == "Daytime", "response_hours"].dropna()
+night = df.loc[df["day_period"] == "Nighttime", "response_hours"].dropna()
+
+# Two-sample t-test (unequal variances)
+t_stat, p_value = stats.ttest_ind(day, night, equal_var=False)
+
+print(f"T-statistic: {t_stat:.3f}")
+print(f"P-value: {p_value:.5f}")
+
+# Summary statistics
+print("\nMean daytime response:", day.mean())
+print("Mean nighttime response:", night.mean())
+```
+
+Hypotheses:  
+- H0 (Null Hypothesis): The mean response time is the same for daytime and 
+nighttime complaints.  
+  $H_0 = 0$   
+- H1 (Alternative Hypothesis): The mean response time differs between daytime 
+and nighttime complaints.  
+  $H_1 \neq 0$
+
+Conclusion:  
+Because the p-value is less than 0.05, (p < 0.001), we reject the null hypothesis.
+This means that the difference in response times between day and night is 
+statistically significant. Complaints filed during the daytime may face higher 
+service demand or workload pressure, leading to slower resolutions. In conclusion, 
+daytime complaints result in a longer response time on average.
+
+**iii.)**
+
+```{python}
+# Create binary variable: 1 if response time >= 2 hours, else 0
+df["over2h"] = (df["response_hours"] >= 2).astype(int)
+
+# Quick summary check
+print(df["over2h"].value_counts(normalize=True).round(3))
+```
+
+**iv.)**
+
+```{python}
+# Chi-Square Tests: Factors Associated with Long Response Times
+from scipy.stats import chi2_contingency
+
+# Complaint type vs over2h
+tbl_type = pd.crosstab(df["complaint_type"], df["over2h"])
+chi2_type, p_type, dof_type, exp_type = chi2_contingency(tbl_type)
+
+# Borough vs over2h
+tbl_boro = pd.crosstab(df["borough"], df["over2h"])
+chi2_boro, p_boro, dof_boro, exp_boro = chi2_contingency(tbl_boro)
+
+# Weekday/weekend vs over2h
+tbl_week = pd.crosstab(df["is_weekend"], df["over2h"])
+chi2_week, p_week, dof_week, exp_week = chi2_contingency(tbl_week)
+
+print(f"Complaint Type p-value: {p_type:.5f}")
+print(f"Borough p-value: {p_boro:.5f}")
+print(f"Weekday vs Weekend p-value: {p_week:.5f}")
+```
+
+Hypotheses:  
+- H0 (Null Hypothesis): The likelihood of a complaint taking two or more hours 
+to close (over2h = 1) is independent of complaint type, borough, and weekday/weekend.    
+  $H_0 = 0$    
+- H1 (Alternative Hypothesis): The likelihood of a complaint taking two or more 
+hours to close depends on at least one of these factors.    
+  $H_1 \neq 0$. 
+
+Conclusion:    
+All three tests produced p-values less than 0.05, (p < 0.001), so we reject the 
+null hypothesis for complaint type, borough, and weekday/weekend. This means 
+that the probability of a service request taking over two hours varies 
+significantly across complaint types, boroughs, and whether the complaint was 
+made on a weekday or weekend. In conclusion, the time it takes to resolve a 
+noise complaint depends on what type of noise is reported, where it occurs, 
+and when it is submitted.
+
+
+### C. Data Analysis
+
+**i.)**
+
+```{python}
+# Geocode NYPD precinct addresses
+import requests
+import pandas as pd
+
+# Load precinct data
+precincts = pd.read_csv("data/nypd_precincts.csv", encoding="latin1")
+precincts["full_address"] = precincts["Address"] + ", New York, NY"
+
+# Define function to call Census Geocoding API
+def census_geocode(address):
+    url = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
+    params = {"address": address, "benchmark": "Public_AR_Current", "format": "json"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        matches = data.get("result", {}).get("addressMatches", [])
+        if matches:
+            coords = matches[0]["coordinates"]
+            return coords["y"], coords["x"]  # (lat, lon)
+    except Exception as e:
+        print(f"Error: {address} -> {e}")
+    return (None, None)
+
+# Apply geocoding to each address
+precincts[["latitude", "longitude"]] = precincts["full_address"].apply(
+    lambda x: pd.Series(census_geocode(x))
+)
+
+# Save results
+precincts.to_csv("data/nypd_precincts_geocoded.csv", index=False)
+print("Saved geocoded precincts to data/nypd_precincts_geocoded.csv")
+```
+
+**ii.)**
+
+```{python}
+import numpy as np
+
+# Define haversine distance (returns km)
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371  # Earth radius in km
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2)**2
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+# Ensure complaint coordinates are numeric
+df = df.dropna(subset=["latitude", "longitude"]).copy()
+
+# Compute distance to every precinct and take the minimum
+def nearest_precinct_distance(lat, lon):
+    distances = haversine(lat, lon, precincts["latitude"], precincts["longitude"])
+    return distances.min()
+
+# Apply to all complaints
+df["dist2pp"] = df.apply(
+    lambda row: nearest_precinct_distance(row["latitude"], row["longitude"]),
+    axis=1
+)
+
+print(df["dist2pp"].describe())
+```
+
+**iii.)**
+
+```{python}
+# Add ZIP Code-level socioeconomic data using the Census API
+from census import Census
+import pandas as pd
+
+# Load Census API key
+with open("/Users/abbywhite/stat3255/ids-f25/censusAPIkey.txt") as f:
+    API_KEY = f.read().strip()
+
+# Initialize Census client
+c = Census(API_KEY)
+
+# Pull 2023 ACS 5-Year data for all New York ZIP Code Tabulation Areas
+acs = c.acs5.state_zipcode(
+    ["B19013_001E",  # Median Household Income
+     "B01003_001E",  # Total Population
+     "B25077_001E",  # Median Home Value
+     "B25064_001E",  # Median Gross Rent
+     "B25003_001E",  # Total housing units
+     "B25003_003E",  # Renter-occupied units
+     "B15003_001E",  # Pop. 25+ (education base)
+     "B15003_022E", "B15003_023E", "B15003_024E", "B15003_025E",  # Bachelor's+
+     "B23025_003E",  # Labor force total
+     "B23025_005E",  # Unemployed
+     "B17001_001E",  # Poverty base
+     "B17001_002E",  # Below poverty
+     "B02001_001E",  # Total race population
+     "B02001_002E"], # White alone
+    "36", "*", year=2023
+)
+
+# Convert to DataFrame
+acs_df = pd.DataFrame(acs)
+
+# Compute derived percentages
+acs_df["Pct_Renters"] = (acs_df["B25003_003E"] / acs_df["B25003_001E"]) * 100
+acs_df["Pct_CollegeEdu"] = (
+    (acs_df["B15003_022E"] + acs_df["B15003_023E"] +
+     acs_df["B15003_024E"] + acs_df["B15003_025E"]) /
+    acs_df["B15003_001E"]
+) * 100
+acs_df["Pct_Unemployed"] = (acs_df["B23025_005E"] / acs_df["B23025_003E"]) * 100
+acs_df["Pct_Poverty"] = (acs_df["B17001_002E"] / acs_df["B17001_001E"]) * 100
+acs_df["Pct_Nonwhite"] = (1 - (acs_df["B02001_002E"] / acs_df["B02001_001E"])) * 100
+
+# Keep and rename relevant columns
+acs_df = acs_df[[
+    "zip code tabulation area", "B19013_001E", "B01003_001E",
+    "B25077_001E", "B25064_001E",
+    "Pct_Renters", "Pct_CollegeEdu", "Pct_Unemployed",
+    "Pct_Poverty", "Pct_Nonwhite"
+]].rename(columns={
+    "zip code tabulation area": "zip_code",
+    "B19013_001E": "Median_Household_Income",
+    "B01003_001E": "Total_Population",
+    "B25077_001E": "Median_Home_Value",
+    "B25064_001E": "Median_Rent"
+})
+acs_df["zip_code"] = acs_df["zip_code"].astype(str).str.zfill(5)
+
+# Merge with NYC noise complaint dataset
+df["zip_code"] = df["incident_zip"].astype(str).str.zfill(5)
+df = df.merge(acs_df, on="zip_code", how="left")
+
+# Preview merged data
+print("Census ACS data merged successfully")
+print(df[[
+    "zip_code", "Median_Household_Income", "Total_Population",
+    "Pct_Renters", "Pct_Poverty", "Pct_CollegeEdu"
+]].head())
+
+# save to file for reuse
+df.to_parquet("data/nypd_noise_with_acs.parquet", index=False)
+print("Saved merged dataset to data/nypd_noise_with_acs.parquet")
+```
+
+**iv.)**
+
+```{python}
+# Model setup: noise complaints only + target variable
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    classification_report, confusion_matrix, f1_score, roc_auc_score
+)
+
+# Filter to noise complaints only
+noise_df = df[df["complaint_type"].str.contains("Noise", case=False, na=False)].copy()
+
+# Drop missing outcome values
+noise_df = noise_df.dropna(subset=["over2h"])
+
+# Define predictors and target
+features = [
+    "borough", "complaint_type", "is_weekend",
+    "Median_Household_Income", "Pct_Poverty", "Pct_Renters",
+    "Pct_CollegeEdu", "Pct_Unemployed", "Pct_Nonwhite", "dist2pp"
+]
+X = noise_df[features]
+y = noise_df["over2h"].astype(int)
+
+# Split data: 80% train, 20% test
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=1234, stratify=y
+)
+
+# Build and tune logistic regression model
+from sklearn.linear_model import LogisticRegression
+
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+
+# Define categorical and numeric columns
+cat_cols = ["borough", "complaint_type", "is_weekend"]
+num_cols = [col for col in X.columns if col not in cat_cols]
+
+# Preprocess: impute missing numeric values, scale, and one-hot encode
+preprocessor = ColumnTransformer([
+    ("num", Pipeline([
+        ("impute", SimpleImputer(strategy="mean")),     # fills NaN with column mean
+        ("scale", StandardScaler())
+    ]), num_cols),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)
+])
+
+# Logistic regression with regularization
+log_reg = LogisticRegression(max_iter=1000, solver="liblinear", class_weight="balanced")
+
+# Tune regularization parameter C via cross-validation
+param_grid = {"C": np.logspace(-3, 3, 10)}  # from 0.001 to 1000
+grid = GridSearchCV(log_reg, param_grid, cv=5, scoring="f1")
+
+# Create full pipeline
+model = Pipeline(steps=[
+    ("preprocess", preprocessor),
+    ("logreg", grid)
+])
+
+# Fit model
+model.fit(X_train, y_train)
+
+# Retrieve best model
+best_model = model.named_steps["logreg"].best_estimator_
+print("Best C parameter:", model.named_steps["logreg"].best_params_)
+
+# Interpret Logistic Regression Coefficients
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Get feature names after one-hot encoding
+encoded_features = model.named_steps["preprocess"].get_feature_names_out()
+
+# Extract coefficients from the best model
+coefs = best_model.coef_.flatten()
+coef_df = pd.DataFrame({
+    "Feature": encoded_features,
+    "Coefficient": coefs,
+    "Odds_Ratio": np.exp(coefs)
+}).sort_values(by="Odds_Ratio", ascending=False)
+
+# Display top and bottom predictors
+print("\nTop 10 Predictors Increasing Odds of Slow Response (>2h):")
+print(coef_df.head(10))
+print("\nTop 10 Predictors Decreasing Odds of Slow Response (>2h):")
+print(coef_df.tail(10))
+```
+
+A logistic regression model was built to predict whether a noise complaint 
+took more than two hours to resolve (over2h = 1). The data was split into 80% 
+training and 20% testing using a random seed of 1234 to ensure reproducibility. 
+All engineered variables were used, including borough, complaint type, weekend 
+indicator, socioeconomic variables from the Census, and distance to the nearest 
+police precinct. The regularization parameter C was tuned using 5-fold 
+cross-validation over a range of values (0.001-1000), and the best value was 
+C = 0.1, which provided the best balance between bias and variance. Complaints 
+in the Bronx, especially residential or vehicle noise cases, were more likely to 
+take longer to resolve. In contrast, complaints in Manhattan and Brooklyn, 
+street/sidewalk noise cases, and those closer to precincts were resolved faster. 
+Overall, the model shows that response time depends on where and what type of 
+complaint is made, with borough and complaint type being the strongest predictors.
+
+**v.)**
+
+```{python}
+# Evaluate model on test data
+y_pred = model.predict(X_test)
+y_prob = model.predict_proba(X_test)[:, 1]
+
+print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
+print("F1 Score:", round(f1_score(y_test, y_pred), 3))
+print("ROC-AUC:", round(roc_auc_score(y_test, y_prob), 3))
+```
+
+The model's performance was moderate. It correctly predicted about 58% of 
+cases, with an F1 score of 0.40 and an ROC-AUC of 0.63, meaning it can 
+distinguish faster versus slower responses better than random guessing but not 
+perfectly. This means the model does a decent, but not perfect job of 
+identifying which noise complaints are likely to take longer than two hours to 
+resolve. It performs best at spotting quick responses but sometimes struggles 
+with predicting slower ones. For a New Yorker, the takeaway is that complaint 
+response time isn't random, it depends on where you live and what kind of noise 
+you report. Complaints in the Bronx or involving residential and vehicle noise 
+tend to take longer, while those in Manhattan or near a police precinct are 
+handled faster.
